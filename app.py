@@ -22,6 +22,7 @@ Groq API key is configured through environment variables or Streamlit secrets.
 import json
 import os
 import pickle
+import re
 
 import requests
 import faiss
@@ -38,35 +39,24 @@ APP_SUBTITLE = "AI Knowledge Investigation Assistant"
 
 ARTIFACTS_DIR = "model"
 
-# Keep credentials in environment variables or Streamlit secrets.
-# Example:
-#   export GROQ_API_KEY="..."
-#   setx GROQ_API_KEY "..."   # Windows PowerShell
-# or create .streamlit/secrets.toml with GROQ_API_KEY = "..."
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-
-# Groq model availability depends on the account. Use IDs that are active for this
-# key; older or decommissioned model names can return 404, empty content, or no
-# usable answer.
-DEFAULT_GENERATION_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-DEFAULT_REWRITE_MODEL = os.getenv("GROQ_REWRITE_MODEL", "llama-3.3-70b-versatile")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_REWRITE_MODEL = os.getenv("GEMINI_REWRITE_MODEL", GEMINI_MODEL)
+GROQ_GENERATION_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_REWRITE_MODEL = os.getenv("GROQ_REWRITE_MODEL", GROQ_GENERATION_MODEL)
 
 FALLBACK_GENERATION_MODELS = [
-    DEFAULT_GENERATION_MODEL,
+    GROQ_GENERATION_MODEL,
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "openai/gpt-oss-20b",
 ]
 
 FALLBACK_REWRITE_MODELS = [
-    DEFAULT_REWRITE_MODEL,
+    GROQ_REWRITE_MODEL,
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "openai/gpt-oss-20b",
 ]
-
-GENERATION_MODEL = os.getenv("GROQ_MODEL") or DEFAULT_GENERATION_MODEL
-REWRITE_MODEL = os.getenv("GROQ_REWRITE_MODEL") or DEFAULT_REWRITE_MODEL
 
 TOP_K = 5
 TEMPERATURE = 0.5
@@ -241,32 +231,37 @@ st.markdown(
 
 
 # ============================================================================
-# Groq API key
+# Model API credentials
 # ============================================================================
 
-def get_api_key():
-    """Load the Groq API key from environment variables or Streamlit secrets."""
+def get_api_credentials():
+    """Return credentials paired with the provider that issued them."""
 
     try:
-        secrets_key = st.secrets.get("GROQ_API_KEY", "")
+        secrets = st.secrets
     except Exception:
-        secrets_key = ""
+        secrets = {}
 
-    api_key = (
-        os.getenv("GROQ_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-        or secrets_key
-        or GROQ_API_KEY
+    gemini_key = os.getenv("GEMINI_API_KEY") or secrets.get("GEMINI_API_KEY", "")
+    groq_key = os.getenv("GROQ_API_KEY") or secrets.get("GROQ_API_KEY", "")
+
+    if gemini_key and str(gemini_key).strip():
+        return "gemini", str(gemini_key).strip()
+    if groq_key and str(groq_key).strip():
+        return "groq", str(groq_key).strip()
+
+    st.error(
+        "Model API key is missing. Configure GEMINI_API_KEY or GROQ_API_KEY "
+        "in the environment or Streamlit secrets."
     )
+    st.stop()
 
-    if not api_key or not str(api_key).strip():
-        st.error(
-            "Groq API key is missing. Add it to your environment as GROQ_API_KEY "
-            "or create .streamlit/secrets.toml with GROQ_API_KEY = \"...\" and restart the app."
-        )
-        st.stop()
 
-    return str(api_key).strip()
+@st.cache_resource
+def load_gemini_client(api_key):
+    from google import genai
+
+    return genai.Client(api_key=api_key)
 
 # ============================================================================
 # Load artifacts
@@ -290,6 +285,12 @@ def load_artifacts(directory: str):
 
     with open(metadata_path, "rb") as f:
         metadata = pickle.load(f)
+
+    if index.ntotal != len(metadata):
+        raise ValueError(
+            f"FAISS index contains {index.ntotal} vectors but metadata contains "
+            f"{len(metadata)} records. Rebuild the model artifacts."
+        )
 
     return config, index, metadata
 
@@ -329,10 +330,9 @@ def search_index(
 
     faiss.normalize_L2(q)
 
-    scores, ids = index.search(
-        q,
-        top_k,
-    )
+    incident_match = re.search(r"\bINC-\d+\b", str(query), re.IGNORECASE)
+    search_count = index.ntotal if incident_match else top_k
+    scores, ids = index.search(q, search_count)
 
     results = []
 
@@ -348,7 +348,16 @@ def search_index(
             }
         )
 
-    return results
+    if incident_match:
+        incident_id = incident_match.group(0).upper()
+        results.sort(
+            key=lambda item: (
+                str(item.get("incident_id", "")).upper() != incident_id,
+                -item["score"],
+            )
+        )
+
+    return results[:top_k]
 
 
 # ============================================================================
@@ -377,6 +386,7 @@ def build_rag_prompt(
     question,
     evidence,
     history_text,
+    incident_ids,
 ):
 
     evidence_block = "\n\n".join(
@@ -395,19 +405,26 @@ def build_rag_prompt(
     return f"""
 You are AI Detective.
 
-Answer the user's question using ONLY the retrieved evidence
-and the conversation below.
+Answer the user's actual question directly. Use retrieved evidence for factual
+claims about incidents; do not merely copy a retrieved passage.
 
 Rules:
 
 - Never invent facts.
-- If the evidence is insufficient, clearly say that the evidence is insufficient.
+- If the user greets you or makes casual conversation, respond naturally and briefly
+    in the same language without forcing unrelated incident evidence into the reply.
+- If asked which incidents are in the database, use the available incident IDs below.
+- For an investigative question, if evidence is insufficient, say so clearly.
 - A shared detail across cases is only a POSSIBLE connection, never proof.
 - Do not treat similarity as proof of identity or causation.
 - Mention relevant incident IDs when synthesizing multiple sources.
-- Keep the answer concise but informative.
+- Give a useful, specific answer with enough detail to address the question.
+- Answer in the same language as the user's question.
 - Prefer direct evidence over assumptions.
 - If multiple pieces of evidence conflict, explicitly mention the conflict.
+
+Available incident IDs:
+{", ".join(incident_ids) or "none"}
 
 Conversation so far:
 {history_text or "(none)"}
@@ -423,14 +440,17 @@ Answer:
 
 
 # ============================================================================
-# Groq client
+# Model client
 # ============================================================================
 
 def get_client():
-    """Create a Groq-compatible API client."""
+    """Create a client using credentials for their matching provider."""
 
-    api_key = get_api_key()
-    return {"api_key": api_key, "provider": "groq"}
+    provider, api_key = get_api_credentials()
+    client = {"api_key": api_key, "provider": provider}
+    if provider == "gemini":
+        client["client"] = load_gemini_client(api_key)
+    return client
 
 
 # ============================================================================
@@ -511,9 +531,23 @@ def generate_text(
     temperature=0.5,
     fallback_models=None,
 ):
-    """Generate text via the Groq OpenAI-compatible API with fallback model support."""
+    """Generate text with the provider paired to the configured API key."""
 
     api_key = client["api_key"]
+    if client["provider"] == "gemini":
+        response = client["client"].interactions.create(
+            model=model or GEMINI_MODEL,
+            input=prompt,
+            generation_config={
+                "temperature": temperature,
+                "max_output_tokens": max_tokens,
+            },
+        )
+        text = str(response.output_text or "").strip()
+        if not text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return text
+
     url = "https://api.groq.com/openai/v1/chat/completions"
     candidate_models = []
 
@@ -620,7 +654,7 @@ Rewritten question:
         rewritten = generate_text(
             client=client,
             prompt=prompt,
-            model=REWRITE_MODEL,
+            model=(GEMINI_REWRITE_MODEL if client["provider"] == "gemini" else GROQ_REWRITE_MODEL),
             max_tokens=60,
             temperature=0.3,
             fallback_models=FALLBACK_REWRITE_MODELS,
@@ -634,44 +668,28 @@ Rewritten question:
 
 
 # ============================================================================
-# Main RAG answer
+# Conversational input routing
 # ============================================================================
 
-def fallback_answer_from_evidence(question, evidence):
-    """Answer from retrieved evidence when model generation fails."""
+def is_casual_conversation(question):
+    """Avoid attaching unrelated case evidence to greetings and small talk."""
 
-    if not evidence:
-        return (
-            "I could not find strong evidence for this question in the retrieved records. "
-            "Please ask about a specific incident or evidence item."
-        )
+    normalized = str(question).strip().lower()
+    normalized = re.sub(r"[\u064B-\u065F\u0670]", "", normalized)
+    normalized = normalized.translate(str.maketrans("أإآ", "ااا"))
 
-    lower_question = str(question).lower()
-    extracted = []
+    greeting_pattern = r"^(اهلا|مرحبا|السلام عليكم|صباح الخير|مساء الخير|hello|hi)(?:\b|$)"
+    if re.match(greeting_pattern, normalized):
+        return True
 
-    for item in evidence:
-        text = str(item.get("text") or "")
-        lower_text = text.lower()
-        if "vehicle" in lower_question or "car" in lower_question or "van" in lower_question or "sedan" in lower_question:
-            if "vehicle:" in lower_text or "vehicle" in lower_text or "sedan" in lower_text or "van" in lower_text:
-                extracted.append(text)
-        elif "where" in lower_question or "location" in lower_question:
-            if "location:" in lower_text or "location" in lower_text:
-                extracted.append(text)
-        elif "who" in lower_question or "suspect" in lower_question or "driver" in lower_question:
-            if "suspect" in lower_text or "driver" in lower_text or "person" in lower_text:
-                extracted.append(text)
+    return any(term in normalized for term in ("بحب", "احب", "i love", "i like"))
 
-    if not extracted:
-        extracted = [str(evidence[0].get("text") or "")]
 
-    summary = extracted[0]
-    if len(summary) > 450:
-        summary = summary[:450].rstrip() + "..."
-
-    return (
-        "Based on the retrieved evidence: "
-        f"{summary}"
+def is_case_list_question(question):
+    normalized = str(question).strip().lower()
+    return any(
+        term in normalized
+        for term in ("القضايا", "الحوادث", "list cases", "show cases", "what cases")
     )
 
 
@@ -702,23 +720,25 @@ def rag_answer(
     # 1. Rewrite question using conversation history
     # ------------------------------------------------------------
 
-    contextualized = contextualize_query(
-        client,
-        history,
-        question,
-    )
+    casual_conversation = is_casual_conversation(question)
+    case_list_question = is_case_list_question(question)
+    contextualized = question
+    if history and not casual_conversation and not case_list_question:
+        contextualized = contextualize_query(client, history, question)
 
     # ------------------------------------------------------------
     # 2. Retrieve evidence
     # ------------------------------------------------------------
 
-    evidence = search_index(
-        contextualized,
-        embed_model,
-        index,
-        metadata,
-        top_k=top_k,
-    )
+    evidence = []
+    if not casual_conversation and not case_list_question:
+        evidence = search_index(
+            contextualized,
+            embed_model,
+            index,
+            metadata,
+            top_k=top_k,
+        )
 
     # ------------------------------------------------------------
     # 3. Build grounded RAG prompt
@@ -728,40 +748,48 @@ def rag_answer(
         question,
         evidence,
         build_context(history),
+        sorted(
+            {
+                str(item.get("incident_id", "")).upper()
+                for item in metadata
+                if re.fullmatch(r"INC-\d+", str(item.get("incident_id", "")).upper())
+            }
+        ),
     )
 
     # ------------------------------------------------------------
     # 4. Generate final answer
     # ------------------------------------------------------------
 
+    generation_error = None
     try:
         answer = generate_text(
             client=client,
             prompt=prompt,
-            model=GENERATION_MODEL,
+            model=(GEMINI_MODEL if client["provider"] == "gemini" else GROQ_GENERATION_MODEL),
             max_tokens=500,
             temperature=temperature,
-            fallback_models=FALLBACK_GENERATION_MODELS,
+            fallback_models=(FALLBACK_GENERATION_MODELS if client["provider"] == "groq" else None),
         )
-    except Exception:
-        answer = fallback_answer_from_evidence(question, evidence)
+    except Exception as error:
+        answer = ""
+        error_text = str(error)
+        api_key = client.get("api_key")
+        if api_key:
+            error_text = error_text.replace(api_key, "[REDACTED]")
+        generation_error = f"{type(error).__name__}: {error_text[:300]}"
 
     # ------------------------------------------------------------
     # 5. Update conversation memory
     # ------------------------------------------------------------
 
-    history.extend(
-        [
-            {
-                "role": "user",
-                "content": question,
-            },
-            {
-                "role": "assistant",
-                "content": answer,
-            },
-        ]
-    )
+    if not generation_error:
+        history.extend(
+            [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer},
+            ]
+        )
 
     # ------------------------------------------------------------
     # 6. Return result
@@ -771,6 +799,7 @@ def rag_answer(
         "answer": answer,
         "original_question": question,
         "contextualized_question": contextualized,
+        "generation_error": generation_error,
         "sources": [
             {
                 key: evidence_item[key]
@@ -818,11 +847,9 @@ try:
         ARTIFACTS_DIR
     )
 
-except FileNotFoundError as error:
+except (FileNotFoundError, ValueError) as error:
 
-    st.error(
-        f"Setup error: couldn't find `{error}`."
-    )
+    st.error(f"Setup error: {error}")
 
     st.info(
         f"Make sure the `{ARTIFACTS_DIR}/` folder contains:\n\n"
@@ -896,9 +923,11 @@ for message in st.session_state.messages:
 
     with st.chat_message(message["role"]):
 
-        st.markdown(
-            message["content"]
-        )
+        if message["content"]:
+            st.markdown(message["content"])
+
+        if message.get("generation_error"):
+            st.warning(f"تعذر توليد الرد. التفاصيل: {message['generation_error']}")
 
         if (
             message["role"] == "assistant"
@@ -993,15 +1022,16 @@ if question:
                     temperature=TEMPERATURE,
                 )
 
-            except Exception:
-
+            except Exception as error:
+                error_text = str(error)
+                api_key = client.get("api_key")
+                if api_key:
+                    error_text = error_text.replace(api_key, "[REDACTED]")
                 result = {
-                    "answer": (
-                        "تمت معالجة الطلب باستخدام الأدلة المسترجعة فقط، لأن النموذج لا يستجيب الآن. "
-                        "يرجى إعادة المحاولة إذا رغبت، أو طرح سؤال حول حادثة محددة."
-                    ),
+                    "answer": "",
                     "original_question": question,
                     "contextualized_question": question,
+                    "generation_error": f"{type(error).__name__}: {error_text[:300]}",
                     "sources": [],
                 }
 
@@ -1009,9 +1039,14 @@ if question:
         # Show answer
         # --------------------------------------------------------
 
-        st.markdown(
-            result["answer"]
-        )
+        if result["answer"]:
+            st.markdown(result["answer"])
+
+        if result.get("generation_error"):
+            st.warning(
+                "تعذر توليد الرد من نموذج الذكاء الاصطناعي. "
+                f"التفاصيل: {result['generation_error']}"
+            )
 
         # --------------------------------------------------------
         # Show sources
@@ -1065,6 +1100,7 @@ if question:
         {
             "role": "assistant",
             "content": result["answer"],
+            "generation_error": result.get("generation_error"),
             "sources": result["sources"],
         }
     )
