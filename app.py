@@ -59,6 +59,10 @@ FALLBACK_REWRITE_MODELS = [
 ]
 
 TOP_K = 5
+# Minimum cosine score for a chunk to count as evidence.
+# e5 scores cluster high, so calibrate this with the debug line below.
+MIN_SCORE = float(os.getenv("MIN_SCORE", "0.80"))
+DEBUG_SCORES = os.getenv("DEBUG_SCORES", "0") == "1"
 TEMPERATURE = 0.5
 SHOW_SOURCES = True
 
@@ -318,6 +322,7 @@ def search_index(
     index,
     metadata,
     top_k=5,
+    min_score=MIN_SCORE,
 ):
     """
     Search the FAISS index using multilingual-e5-base.
@@ -348,6 +353,9 @@ def search_index(
             }
         )
 
+    if DEBUG_SCORES:
+        st.sidebar.write("scores:", [round(r["score"], 3) for r in results[:top_k]])
+
     if incident_match:
         incident_id = incident_match.group(0).upper()
         results.sort(
@@ -356,6 +364,14 @@ def search_index(
                 -item["score"],
             )
         )
+        # An explicit INC-xxx lookup is always kept; everything else needs a real score.
+        results = [
+            r for r in results
+            if r["score"] >= min_score
+            or str(r.get("incident_id", "")).upper() == incident_id
+        ]
+    else:
+        results = [r for r in results if r["score"] >= min_score]
 
     return results[:top_k]
 
@@ -411,6 +427,9 @@ claims about incidents; do not merely copy a retrieved passage.
 Rules:
 
 - Never invent facts.
+- Answer ONLY from the retrieved evidence and the incident list. Never use outside
+    general knowledge (sports, celebrities, news, etc.). If the question is not about
+    the incidents in the database, say it is outside the scope of this database.
 - If the user greets you or makes casual conversation, respond naturally and briefly
     in the same language without forcing unrelated incident evidence into the reply.
 - If asked which incidents are in the database, use the available incident IDs below.
@@ -676,431 +695,4 @@ def is_casual_conversation(question):
 
     normalized = str(question).strip().lower()
     normalized = re.sub(r"[\u064B-\u065F\u0670]", "", normalized)
-    normalized = normalized.translate(str.maketrans("أإآ", "ااا"))
-
-    greeting_pattern = r"^(اهلا|مرحبا|السلام عليكم|صباح الخير|مساء الخير|hello|hi)(?:\b|$)"
-    if re.match(greeting_pattern, normalized):
-        return True
-
-    return any(term in normalized for term in ("بحب", "احب", "i love", "i like"))
-
-
-def is_case_list_question(question):
-    normalized = str(question).strip().lower()
-    return any(
-        term in normalized
-        for term in ("القضايا", "الحوادث", "list cases", "show cases", "what cases")
-    )
-
-
-def rag_answer(
-    client,
-    question,
-    history,
-    index,
-    embed_model,
-    metadata,
-    top_k=TOP_K,
-    temperature=TEMPERATURE,
-):
-
-    if is_abusive_or_empty_request(question):
-        fallback = (
-            "I can’t help with abusive or non-investigative requests. "
-            "Please ask a question about the case evidence or incident records."
-        )
-        return {
-            "answer": fallback,
-            "original_question": question,
-            "contextualized_question": question,
-            "sources": [],
-        }
-
-    # ------------------------------------------------------------
-    # 1. Rewrite question using conversation history
-    # ------------------------------------------------------------
-
-    casual_conversation = is_casual_conversation(question)
-    case_list_question = is_case_list_question(question)
-    contextualized = question
-    if history and not casual_conversation and not case_list_question:
-        contextualized = contextualize_query(client, history, question)
-
-    # ------------------------------------------------------------
-    # 2. Retrieve evidence
-    # ------------------------------------------------------------
-
-    evidence = []
-    if not casual_conversation and not case_list_question:
-        evidence = search_index(
-            contextualized,
-            embed_model,
-            index,
-            metadata,
-            top_k=top_k,
-        )
-
-    # ------------------------------------------------------------
-    # 3. Build grounded RAG prompt
-    # ------------------------------------------------------------
-
-    prompt = build_rag_prompt(
-        question,
-        evidence,
-        build_context(history),
-        sorted(
-            {
-                str(item.get("incident_id", "")).upper()
-                for item in metadata
-                if re.fullmatch(r"INC-\d+", str(item.get("incident_id", "")).upper())
-            }
-        ),
-    )
-
-    # ------------------------------------------------------------
-    # 4. Generate final answer
-    # ------------------------------------------------------------
-
-    generation_error = None
-    try:
-        answer = generate_text(
-            client=client,
-            prompt=prompt,
-            model=(GEMINI_MODEL if client["provider"] == "gemini" else GROQ_GENERATION_MODEL),
-            max_tokens=500,
-            temperature=temperature,
-            fallback_models=(FALLBACK_GENERATION_MODELS if client["provider"] == "groq" else None),
-        )
-    except Exception as error:
-        answer = ""
-        error_text = str(error)
-        api_key = client.get("api_key")
-        if api_key:
-            error_text = error_text.replace(api_key, "[REDACTED]")
-        generation_error = f"{type(error).__name__}: {error_text[:300]}"
-
-    # ------------------------------------------------------------
-    # 5. Update conversation memory
-    # ------------------------------------------------------------
-
-    if not generation_error:
-        history.extend(
-            [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": answer},
-            ]
-        )
-
-    # ------------------------------------------------------------
-    # 6. Return result
-    # ------------------------------------------------------------
-
-    return {
-        "answer": answer,
-        "original_question": question,
-        "contextualized_question": contextualized,
-        "generation_error": generation_error,
-        "sources": [
-            {
-                key: evidence_item[key]
-                for key in (
-                    "source_type",
-                    "source_name",
-                    "page",
-                    "row_number",
-                    "incident_id",
-                    "score",
-                )
-            }
-            for evidence_item in evidence
-        ],
-    }
-
-
-# ============================================================================
-# Header
-# ============================================================================
-
-st.markdown(
-    f"""
-    <div class="ai-detective-header">
-        <div style="font-size:2.2rem;">
-            🕵️
-        </div>
-        <div>
-            <h1>{APP_TITLE}</h1>
-            <p>{APP_SUBTITLE}</p>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================================
-# Startup checks
-# ============================================================================
-
-try:
-
-    config, index, metadata = load_artifacts(
-        ARTIFACTS_DIR
-    )
-
-except (FileNotFoundError, ValueError) as error:
-
-    st.error(f"Setup error: {error}")
-
-    st.info(
-        f"Make sure the `{ARTIFACTS_DIR}/` folder contains:\n\n"
-        "- config.json\n"
-        "- index.faiss\n"
-        "- metadata.pkl"
-    )
-
-    st.stop()
-
-
-# ============================================================================
-# Load embedding model
-# ============================================================================
-
-embed_model = load_embedding_model(
-    config.get(
-        "embedding_model",
-        "intfloat/multilingual-e5-base",
-    )
-)
-
-
-# ============================================================================
-# Initialize Groq client
-# ============================================================================
-
-try:
-
-    client = get_client()
-
-except Exception as error:
-
-    st.error(
-        f"Groq initialization failed: {error}"
-    )
-    st.stop()
-
-
-# ============================================================================
-# Chat state
-# ============================================================================
-
-if "messages" not in st.session_state:
-
-    st.session_state.messages = []
-
-
-if "rag_history" not in st.session_state:
-
-    st.session_state.rag_history = []
-
-
-# ============================================================================
-# Empty state
-# ============================================================================
-
-if not st.session_state.messages:
-
-    st.caption(
-        "اسأل عن أي حادثة أو تفصيلة، "
-        "وهيجاوبك بناءً على الأدلة المسترجعة فقط."
-    )
-
-
-# ============================================================================
-# Render previous messages
-# ============================================================================
-
-for message in st.session_state.messages:
-
-    with st.chat_message(message["role"]):
-
-        if message["content"]:
-            st.markdown(message["content"])
-
-        if message.get("generation_error"):
-            st.warning(f"تعذر توليد الرد. التفاصيل: {message['generation_error']}")
-
-        if (
-            message["role"] == "assistant"
-            and SHOW_SOURCES
-            and message.get("sources")
-        ):
-
-            with st.expander(
-                f"📎 {len(message['sources'])} source(s) used"
-            ):
-
-                for source in message["sources"]:
-
-                    if source["source_type"] == "pdf":
-                        location = f"page {source['page']}"
-                    else:
-                        location = f"row {source['row_number']}"
-
-                    st.markdown(
-                        f"""
-                        <div class="evidence-card">
-
-                            <span class="evidence-score">
-                                score {source['score']:.2f}
-                            </span>
-
-                            &nbsp;
-
-                            <b>{source['source_name']}</b>
-
-                            ({location})
-
-                            —
-
-                            incident
-                            <code>{source['incident_id']}</code>
-
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-
-# ============================================================================
-# Chat input
-# ============================================================================
-
-question = st.chat_input(
-    "اكتب سؤالك هنا..."
-)
-
-
-# ============================================================================
-# Handle question
-# ============================================================================
-
-if question:
-
-    # ------------------------------------------------------------
-    # Add user message
-    # ------------------------------------------------------------
-
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": question,
-        }
-    )
-
-    with st.chat_message("user"):
-
-        st.markdown(question)
-
-    # ------------------------------------------------------------
-    # Generate assistant response
-    # ------------------------------------------------------------
-
-    with st.chat_message("assistant"):
-
-        with st.spinner("جاري البحث..."):
-
-            try:
-
-                result = rag_answer(
-                    client=client,
-                    question=question,
-                    history=st.session_state.rag_history,
-                    index=index,
-                    embed_model=embed_model,
-                    metadata=metadata,
-                    top_k=TOP_K,
-                    temperature=TEMPERATURE,
-                )
-
-            except Exception as error:
-                error_text = str(error)
-                api_key = client.get("api_key")
-                if api_key:
-                    error_text = error_text.replace(api_key, "[REDACTED]")
-                result = {
-                    "answer": "",
-                    "original_question": question,
-                    "contextualized_question": question,
-                    "generation_error": f"{type(error).__name__}: {error_text[:300]}",
-                    "sources": [],
-                }
-
-        # --------------------------------------------------------
-        # Show answer
-        # --------------------------------------------------------
-
-        if result["answer"]:
-            st.markdown(result["answer"])
-
-        if result.get("generation_error"):
-            st.warning(
-                "تعذر توليد الرد من نموذج الذكاء الاصطناعي. "
-                f"التفاصيل: {result['generation_error']}"
-            )
-
-        # --------------------------------------------------------
-        # Show sources
-        # --------------------------------------------------------
-
-        if (
-            SHOW_SOURCES
-            and result["sources"]
-        ):
-
-            with st.expander(
-                f"📎 {len(result['sources'])} source(s) used"
-            ):
-
-                for source in result["sources"]:
-
-                    if source["source_type"] == "pdf":
-                        location = f"page {source['page']}"
-                    else:
-                        location = f"row {source['row_number']}"
-
-                    st.markdown(
-                        f"""
-                        <div class="evidence-card">
-
-                            <span class="evidence-score">
-                                score {source['score']:.2f}
-                            </span>
-
-                            &nbsp;
-
-                            <b>{source['source_name']}</b>
-
-                            ({location})
-
-                            —
-
-                            incident
-                            <code>{source['incident_id']}</code>
-
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-    # ------------------------------------------------------------
-    # Save assistant message
-    # ------------------------------------------------------------
-
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": result["answer"],
-            "generation_error": result.get("generation_error"),
-            "sources": result["sources"],
-        }
-    )
+   
